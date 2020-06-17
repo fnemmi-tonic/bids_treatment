@@ -41,6 +41,7 @@ class bids_repo(object):
                          numpass = 1,
                          autocrop = False,
                          dilate = 2,
+                         selem = 10,
                          output_type = "NIFTI"):
         """This function will preprocess the diffusion data performing eddy current correction with fsl and eventually denoising with local PCA 
         Parameters
@@ -79,6 +80,7 @@ class bids_repo(object):
                                    numpass = numpass,
                                    autocrop = autocrop,
                                    dilate = dilate,
+                                   selem = selem,
                                    output_type = output_type)
                 otp = pd.DataFrame(data = [["{}_ses-{}".format(subject, visit), "Done"]], columns = ["subjects", "status"])
                 if not(os.path.isfile("{}/subject_status.csv".format(base_output_dir))):
@@ -100,7 +102,8 @@ class bids_repo(object):
                     median_radius = 3,
                     numpass = 1, 
                     autocrop = False,
-                    dilate = 2):
+                    dilate = 2,
+                    output_type = "NIFTI"):
         """This function will output one or more dti index(es) calculated using canonical dti model in dipy    
         Parameters
         ----------
@@ -139,9 +142,8 @@ class bids_repo(object):
                                    visit,
                                    output_dir,
                                    denoised_data,
-                                   indexes, median_radius, numpass,
-                                   autocrop,
-                                   dilate)
+                                   indexes, 
+                                   output_type)
                 otp = pd.DataFrame(data = [["{}_ses-{}".format(subject, visit), "Done"]], columns = ["subjects", "status"])
                 if not(os.path.isfile("{}/subject_status.csv".format(base_output_dir))):
                     otp.to_csv("{}/subject_status.csv".format(base_output_dir), index = False)

@@ -15,18 +15,16 @@ import dipy.reconst.dti as dti
 from dipy.reconst.dti import fractional_anisotropy, mean_diffusivity, radial_diffusivity, axial_diffusivity
 import numpy as np
 from pathlib import PurePath
-from os.path import splitext
+from os.path import splitext, isfile
 import dipy.reconst.fwdti as fwdti
 from dipy.denoise.localpca import localpca
 from dipy.denoise.pca_noise_estimate import pca_noise_estimate
-from nipype.interfaces.fsl.preprocess import FLIRT, FNIRT, ApplyWarp, BET
-from nipype.interfaces.fsl.utils import ImageMaths
+from nipype.interfaces.fsl.preprocess import FLIRT, FNIRT, ApplyWarp
 from nipype.interfaces.fsl.utils import ConvertXFM
 import subprocess
 from utils import get_base_name_all_type 
 from scipy.ndimage.morphology import binary_erosion
-from utils import get_mask_crop_and_indexes
-from os import remove
+from utils import crop_and_indexes, custom_brain_extraction, get_mask_crop_and_indexes
 
 
 
@@ -39,6 +37,7 @@ def dti_preprocessing(diff_dir,
                    numpass = 1,
                    autocrop = False,
                    dilate = 2,
+                   selem = 10,
                    output_type = "NIFTI"):
     """Function to realign, eddy current correct and eventually denoise diffusion data        
         Parameters
@@ -47,6 +46,10 @@ def dti_preprocessing(diff_dir,
                     (as a single 4D nii or nii file), bvec and bval files are stored
         output_dir: absolute path of the directories were the indexes will be written
         denoise : boolean, should denoise using Marcenko-Pastur PCA algorithm be performed
+        fill : boolean, sometimes oshu method create hole in the mask, especially if you are working with populations
+                that may have very low values at B0 in certain structures. Fill use erosion based reconstruction methods
+                to fill in-mask holes.
+        output_type: ["NIFTI", "NIFTI_GZ"], the type of nifti output desired,
         ... : other parameters related to the nipype and dipy functions used
         """
     fdwi = glob("{}/*nii*".format(diff_dir))[0]
@@ -58,50 +61,45 @@ def dti_preprocessing(diff_dir,
     else:
         raise ValueError("Output file type {} not recognized".format(output_type))
     ec_out_file = "{}/{}_ec{}".format(output_dir, output_base_name, ext)
-    ec = EddyCorrect(in_file = fdwi, out_file = ec_out_file)
-    ec.inputs.output_type = output_type
-    print("Eddy Correction")
-    ec.run()
-    temp_img = nb.load(ec_out_file)
-    temp_img_data = temp_img.get_fdata()
-    temp_img_output_name = "{}/{}_b0{}".format(output_dir, output_base_name, ext)
-    nb.save(nb.Nifti1Image(temp_img_data[:,:,:,0], temp_img.affine, temp_img.header), temp_img_output_name)
-    bet_out_file = "{}/{}_ec_bet{}".format(output_dir, output_base_name, ext)
-    bet_out_file_mask = "{}/{}_ec_bet_mask{}".format(output_dir, output_base_name, ext)
-    bet = BET(in_file = temp_img_output_name, out_file = bet_out_file, 
-              frac = .3,
-              mask = True, output_type = output_type)
-    bet.run()
-    masked_dwi_out_file = "{}/{}_ec_masked{}".format(output_dir, output_base_name, ext)
-    img_maths = ImageMaths(in_file = ec_out_file, op_string = "-mul",
-                           in_file2 = bet_out_file_mask, out_file = masked_dwi_out_file,
-                           output_type = output_type)
-    img_maths.run()
+    if not(isfile(ec_out_file)):
+        ec = EddyCorrect(in_file = fdwi, out_file = ec_out_file)
+        ec.inputs.output_type = output_type
+        print("Eddy Correction")
+        ec.run()
+    else:
+        print("Skipping EC")
+    mask_name, masked_name = custom_brain_extraction(output_base_name, 
+                                                     ec_out_file, 
+                                                     output_dir, 
+                                                     output_type, 
+                                                     median_radius, 
+                                                     numpass, 
+                                                     autocrop, 
+                                                     dilate, 
+                                                     selem)
     if denoise:
-        print("Denoising")
-        fbval = glob("{}/*bval".format(diff_dir))[0]
-        fbvec = glob("{}/*bvec".format(diff_dir))[0]
-        bvals, bvecs = read_bvals_bvecs(fbval, fbvec)
-        gtab = gradient_table(bvals, bvecs)
-        img = nb.load(masked_dwi_out_file)
-        x_ix, y_ix, z_ix, mask, maskdata, mask_crop,  maskdata_crop = get_mask_crop_and_indexes(img,
-                                                                                            median_radius = median_radius,
-                                                                                            numpass = numpass,
-                                                                                            autocrop = autocrop,
-                                                                                            dilate = dilate)
-    
-        sigma = pca_noise_estimate(maskdata_crop, gtab, correct_bias=True, smooth=3)
-        denoised_arr = localpca(maskdata_crop, 
-                                sigma, 
-                                tau_factor=2.3, 
-                                patch_radius=2)
-        opt = np.zeros(maskdata.shape)
-        opt[x_ix, y_ix, z_ix, :] = denoised_arr
-        den_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
         denoised_out_file = "{}/{}_denoised{}".format(output_dir, output_base_name, ext)
-        nb.save(den_img, denoised_out_file)
-        remove(ec_out_file)
-        remove(temp_img_output_name)
+        if not(isfile(denoised_out_file)):
+            print("Denoising")
+            fbval = glob("{}/*bval".format(diff_dir))[0]
+            fbvec = glob("{}/*bvec".format(diff_dir))[0]
+            bvals, bvecs = read_bvals_bvecs(fbval, fbvec)
+            gtab = gradient_table(bvals, bvecs)
+            img = nb.load(masked_name)
+            mask = nb.load(mask_name)
+            x_ix, y_ix, z_ix, mask_crop, maskdata_crop = crop_and_indexes(mask,
+                                                                          img)
+            sigma = pca_noise_estimate(maskdata_crop, gtab, correct_bias=True, smooth=3)
+            denoised_arr = localpca(maskdata_crop, 
+                                    sigma, 
+                                    tau_factor=2.3, 
+                                    patch_radius=2)
+            opt = np.zeros(img.shape)
+            opt[x_ix, y_ix, z_ix, :] = denoised_arr
+            den_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
+            nb.save(den_img, denoised_out_file)
+    
+            
         
     
 def dti_processing(base_dir,
@@ -110,9 +108,7 @@ def dti_processing(base_dir,
                    output_dir,
                    denoised_data = True,
                    indexes = ["FA", "MD"], 
-                   median_radius = 3,
-                   numpass = 1, autocrop = False,
-                   dilate = 2):
+                   output_type = "NIFTI"):
     """Function to derive dti indexes from dwi data using dipy functions        
         Parameters
         ----------
@@ -124,6 +120,12 @@ def dti_processing(base_dir,
         indexes : list, a list of the indexes that will be written, accepted values are ["FA", "MD", "RD", "AD"]
         ... : other parameters related to the dipy functions used
         """
+    if output_type == "NIFTI":
+        ext = ".nii"
+    elif output_type == "NIFTI_GZ":
+        ext = ".nii.gz"
+    else:
+        raise ValueError("Output file type {} not recognized".format(output_type))
     diff_dir = "{}/{}/ses-{}/dwi".format(base_dir, subject_id, visit_id)
     fbval = glob("{}/*bval".format(diff_dir))[0]
     fbvec = glob("{}/*bvec".format(diff_dir))[0]
@@ -131,15 +133,13 @@ def dti_processing(base_dir,
     if denoised_data:
         fdwi = glob("{}/*_denoised*".format(dti_preroc_dir))[0]
     else:
-        fdwi = glob("{}/*_ec.nii*".format(dti_preroc_dir))[0]
+        fdwi = glob("{}/*_masked.nii*".format(dti_preroc_dir))[0]
     bvals, bvecs = read_bvals_bvecs(fbval, fbvec)
     gtab = gradient_table(bvals, bvecs)
     img = nb.load(fdwi)
-    x_ix, y_ix, z_ix, mask, maskdata, mask_crop,  maskdata_crop = get_mask_crop_and_indexes(img,
-                                                                                            median_radius = median_radius,
-                                                                                            numpass = numpass,
-                                                                                            autocrop = autocrop,
-                                                                                            dilate = dilate)
+    mask = nb.load(glob("{}/*_mask.nii*".format(dti_preroc_dir))[0])
+    x_ix, y_ix, z_ix, mask_crop, maskdata_crop = crop_and_indexes(mask,
+                                                                  img)
     tenmodel = dti.TensorModel(gtab)
     tenfit = tenmodel.fit(maskdata_crop)
     output_base_name = get_base_name_all_type(fbval)
@@ -148,33 +148,33 @@ def dti_processing(base_dir,
         FA = fractional_anisotropy(tenfit.evals)
         FA[np.isnan(FA)] = 0
         opt = np.zeros(mask.shape)
-        opt[x_ix, y_ix, z_ix] = FA
+        opt[x_ix, y_ix, z_ix] = FA * mask_crop
         fa_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
-        nb.save(fa_img, "{}/{}_FA.nii".format(output_dir, output_base_name))
+        nb.save(fa_img, "{}/{}_FA{}".format(output_dir, output_base_name, ext))
     if "MD" in indexes:
         print("Computing MD")
         MD = mean_diffusivity(tenfit.evals)
         MD[np.isnan(MD)] = 0
         opt = np.zeros(mask.shape)
-        opt[x_ix, y_ix, z_ix] = MD
+        opt[x_ix, y_ix, z_ix] = MD * mask_crop
         md_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
-        nb.save(md_img, "{}/{}_MD.nii".format(output_dir, output_base_name))
+        nb.save(md_img, "{}/{}_MD{}".format(output_dir, output_base_name, ext))
     if "RD" in indexes:
         print("Computing RD")
         RD = radial_diffusivity(tenfit.evals)
         RD[np.isnan(RD)] = 0
         opt = np.zeros(mask.shape)
-        opt[x_ix, y_ix, z_ix] = RD
+        opt[x_ix, y_ix, z_ix] = RD * mask_crop
         rd_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
-        nb.save(rd_img, "{}/{}_RD.nii".format(output_dir, output_base_name))
+        nb.save(rd_img, "{}/{}_RD{}".format(output_dir, output_base_name, ext))
     if "AD" in indexes:
         print("Computing AD")
         AD = axial_diffusivity(tenfit.evals)
         AD[np.isnan(AD)] = 0
         opt = np.zeros(mask.shape)
-        opt[x_ix, y_ix, z_ix] = AD
+        opt[x_ix, y_ix, z_ix] = AD * mask_crop
         ad_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
-        nb.save(ad_img, "{}/{}_AD.nii".format(output_dir, output_base_name))
+        nb.save(ad_img, "{}/{}_AD{}".format(output_dir, output_base_name, ext))
         
 def hybrid_rois_registration(base_dir,
                              subject_id,
@@ -195,6 +195,7 @@ def hybrid_rois_registration(base_dir,
         csf_roi: absolute path of the roi representative of the csf. It should be in the same space as "template" and binary
         wm_roi: absolute path of the roi representative of the wm. It should be in in the same space as "template" and binary
         template: name of the file with extension of the template to be used for inverse registation of the rois. 
+        output_type: ["NIFTI", "NIFTI_GZ"], the type of nifti output desired,
         ... : other parameters related to the dipy functions used
         Returns
         ----------
@@ -321,6 +322,7 @@ def hybrid_intensity_threshold_based(base_dir,
         csf_bound: Percentile of the boundary between wm and csf
         write_masks: boolean. If intensity threshold method has been choses, should the masks be written ? This is useful for debugging. Default to True
         denoised_data: boolean, should the denoised (True) or only the eddy current correct and realigned data (False) be used for fitting ?
+        output_type: ["NIFTI", "NIFTI_GZ"], the type of nifti output desired,
         ... : other parameters related to the dipy functions used
         Returns
         ----------
@@ -424,8 +426,15 @@ def fwdti_processing(base_dir,
         denoised_data: boolean, should the denoised (True) or only the eddy current correct and realigned data (False) be used for fitting ?
         write_masks: boolean. If intensity threshold method has been choses, should the masks be written ? This is useful for debugging. Default to True
         indexes : list, a list of the indexes that will be written, accepted values are ["FA", "MD", "RD", "AD", "FW"]
+        output_type: ["NIFTI", "NIFTI_GZ"], the type of nifti output desired,
         ... : other parameters related to the dipy functions used
         """
+    if output_type == "NIFTI":
+        ext = ".nii"
+    elif output_type == "NIFTI_GZ":
+        ext = ".nii.gz"
+    else:
+        raise ValueError("Output file type {} not recognized".format(output_type))
     diff_dir = "{}/{}/ses-{}/dwi".format(base_dir, subject_id, visit_id)
     fbval = glob("{}/*bval".format(diff_dir))[0]
     fbvec = glob("{}/*bvec".format(diff_dir))[0]
@@ -440,11 +449,9 @@ def fwdti_processing(base_dir,
     bvals = bvals / 1000
     gtab = gradient_table(bvals, bvecs, b0_threshold = 0)
     img = nb.load(fdwi)
-    x_ix, y_ix, z_ix, mask, maskdata, mask_crop,  maskdata_crop = get_mask_crop_and_indexes(img,
-                                                                                            median_radius = median_radius,
-                                                                                            numpass = numpass,
-                                                                                            autocrop = autocrop,
-                                                                                            dilate = dilate)
+    mask = nb.load(glob("{}/*_mask.nii*".format(dti_preroc_dir))[0])
+    x_ix, y_ix, z_ix, mask_crop,  maskdata_crop = crop_and_indexes(mask,
+                                                                   img)
     if init_method == "md":
         print("Fitting tensor")
         tenmodel = fwdti.BeltramiModel(gtab, 
@@ -496,215 +503,215 @@ def fwdti_processing(base_dir,
         FA = fwdti.fractional_anisotropy(tenfit.evals)
         FA[np.isnan(FA)] = 0
         opt = np.zeros(mask.shape)
-        opt[x_ix, y_ix, z_ix] = FA
+        opt[x_ix, y_ix, z_ix] = FA * mask_crop
         fa_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
-        nb.save(fa_img, "{}/{}_fwFA.nii".format(output_dir, output_base_name))
+        nb.save(fa_img, "{}/{}_fwFA{}".format(output_dir, output_base_name, ext))
     if "MD" in indexes:
         print("Computing fwMD")
         MD = fwdti.mean_diffusivity(tenfit.evals)
         MD[np.isnan(MD)] = 0
         opt = np.zeros(mask.shape)
-        opt[x_ix, y_ix, z_ix] = MD
+        opt[x_ix, y_ix, z_ix] = MD * mask_crop
         MD_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
-        nb.save(MD_img, "{}/{}_fwMD.nii".format(output_dir, output_base_name))
+        nb.save(MD_img, "{}/{}_fwMD{}".format(output_dir, output_base_name, ext))
     if "RD" in indexes:
         print("Computing fwRD")
         RD = radial_diffusivity(tenfit.evals)
         RD[np.isnan(RD)] = 0
         opt = np.zeros(mask.shape)
-        opt[x_ix, y_ix, z_ix] = RD
+        opt[x_ix, y_ix, z_ix] = RD * mask_crop
         RD_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
-        nb.save(RD_img, "{}/{}_fwRD.nii".format(output_dir, output_base_name))
+        nb.save(RD_img, "{}/{}_fwRD{}".format(output_dir, output_base_name, ext))
     if "AD" in indexes:
         print("Computing fwAD")
         AD = axial_diffusivity(tenfit.evals)
         AD[np.isnan(AD)] = 0
         opt = np.zeros(mask.shape)
-        opt[x_ix, y_ix, z_ix] = AD
+        opt[x_ix, y_ix, z_ix] = AD * mask_crop
         AD_img = nb.Nifti1Image(opt.astype(np.float32), img.affine)
-        nb.save(AD_img, "{}/{}_fwAD.nii".format(output_dir, output_base_name))
+        nb.save(AD_img, "{}/{}_fwAD{}".format(output_dir, output_base_name, ext))
     if "FW" in indexes:
         print("Computing FW")
         FW = tenfit.fw
         FW[np.isnan(FW)] = 0
         opt = np.zeros(mask.shape)
-        opt[x_ix, y_ix, z_ix] = FW
+        opt[x_ix, y_ix, z_ix] = FW * mask_crop
         fw_image = nb.Nifti1Image(opt.astype(np.float32), img.affine)
-        nb.save(fw_image, "{}/{}_FW.nii".format(output_dir, output_base_name))
+        nb.save(fw_image, "{}/{}_FW{}".format(output_dir, output_base_name, ext))
         
-def diff_direct_registration_crossectional(base_dir,
-                   subject_id,
-                   visit_id,
-                   output_dir,
-                   tbss_like = True,
-                   output_type = "NIFTI",
-                   template = "/usr/local/fsl/data/standard/FMRIB58_FA_1mm.nii.gz",
-                   config_file = "/usr/local/fsl/etc/flirtsch/FA_2_FMRIB58_1mm.cnf"):
-    dti_dir = "{}/derivatives/dipy_dti/{}/ses-{}".format(base_dir, subject_id, visit_id)
-    fdwi = glob("{}/*FA.nii*".format(dti_dir))[0]
-    output_base_name = get_base_name_all_type(fdwi)
-    other_indexes = glob("{}/*nii*".format(dti_dir))
-    other_indexes.remove(fdwi)
-    if output_type == "NIFTI":
-        ext = ".nii"
-    elif output_type == "NIFTI_GZ":
-        ext = ".nii.gz"
-    else:
-        raise ValueError("Output file type {} not recognized".format(output_type))
-    flirt = FLIRT()
-    fnirt = FNIRT()
-    apply_warp = ApplyWarp()
-    flirt.inputs.reference = template
-    flirt.inputs.output_type = output_type
-    fnirt.inputs.ref_file = template
-    fnirt.inputs.output_type = output_type
-    fnirt.inputs.config_file = config_file
-    fnirt.inputs.log_file = "{}/{}_fnirt.txt".format(output_dir, output_base_name)
-    apply_warp.inputs.ref_file = template
-    apply_warp.inputs.output_type = output_type
-    if tbss_like:
-        img = nb.load(fdwi)
-        img_data = img.get_fdata()
-        binary_wm = np.zeros_like(img_data)
-        binary_wm[img_data != 0] = 1
-        eroded_wm_mask = binary_erosion(binary_wm)
-        eroded_wm = img_data * (eroded_wm_mask * 1)
-        eroded_wm[:,:,0] = 0
-        eroded_wm[:,:,-1] = 0
-        clean_fa = nb.Nifti1Image(eroded_wm, img.affine, img.header)
-        nb.save(clean_fa, "{}/{}_clean{}".format(output_dir, output_base_name, ext))
-        flirt.inputs.in_file = "{}/{}_clean{}".format(output_dir, output_base_name, ext)
-        flirt.inputs.out_file = "{}/{}_clean_linear{}".format(output_dir, output_base_name, ext)
-        flirt.inputs.out_matrix_file = "{}/{}_clean_linear.mat".format(output_dir, output_base_name)
-        print("running linear registration")
-        flirt.run()
-        fnirt.inputs.in_file = "{}/{}_clean_linear{}".format(output_dir, output_base_name, ext)
-        fnirt.inputs.warped_file = "{}/{}_clean_nonlinear{}".format(output_dir, output_base_name, ext)
-        fnirt.inputs.field_file = "{}/{}_clean_nonlinearfield{}".format(output_dir, output_base_name, ext)
-        print("running non linear registration")
-        fnirt.run()
-    else:
-        flirt.inputs.in_file = fdwi
-        flirt.inputs.out_file = "{}/{}_linear{}".format(output_dir, output_base_name, ext)
-        flirt.inputs.out_matrix_file = "{}/{}_linear.mat".format(output_dir, output_base_name)
-        print("running linear registration")
-        flirt.run()
-        fnirt.inputs.in_file = "{}/{}_linear{}".format(output_dir, output_base_name, ext)
-        fnirt.inputs.warped_file = "{}/{}_nonlinear{}".format(output_dir, output_base_name, ext)
-        fnirt.inputs.field_file = "{}/{}_nonlinearfield{}".format(output_dir, output_base_name, ext)
-        print("running non linear registration")
-        fnirt.run()
+# def diff_direct_registration_crossectional(base_dir,
+#                    subject_id,
+#                    visit_id,
+#                    output_dir,
+#                    tbss_like = True,
+#                    output_type = "NIFTI",
+#                    template = "/usr/local/fsl/data/standard/FMRIB58_FA_1mm.nii.gz",
+#                    config_file = "/usr/local/fsl/etc/flirtsch/FA_2_FMRIB58_1mm.cnf"):
+#     dti_dir = "{}/derivatives/dipy_dti/{}/ses-{}".format(base_dir, subject_id, visit_id)
+#     fdwi = glob("{}/*FA.nii*".format(dti_dir))[0]
+#     output_base_name = get_base_name_all_type(fdwi)
+#     other_indexes = glob("{}/*nii*".format(dti_dir))
+#     other_indexes.remove(fdwi)
+#     if output_type == "NIFTI":
+#         ext = ".nii"
+#     elif output_type == "NIFTI_GZ":
+#         ext = ".nii.gz"
+#     else:
+#         raise ValueError("Output file type {} not recognized".format(output_type))
+#     flirt = FLIRT()
+#     fnirt = FNIRT()
+#     apply_warp = ApplyWarp()
+#     flirt.inputs.reference = template
+#     flirt.inputs.output_type = output_type
+#     fnirt.inputs.ref_file = template
+#     fnirt.inputs.output_type = output_type
+#     fnirt.inputs.config_file = config_file
+#     fnirt.inputs.log_file = "{}/{}_fnirt.txt".format(output_dir, output_base_name)
+#     apply_warp.inputs.ref_file = template
+#     apply_warp.inputs.output_type = output_type
+#     if tbss_like:
+#         img = nb.load(fdwi)
+#         img_data = img.get_fdata()
+#         binary_wm = np.zeros_like(img_data)
+#         binary_wm[img_data != 0] = 1
+#         eroded_wm_mask = binary_erosion(binary_wm)
+#         eroded_wm = img_data * (eroded_wm_mask * 1)
+#         eroded_wm[:,:,0] = 0
+#         eroded_wm[:,:,-1] = 0
+#         clean_fa = nb.Nifti1Image(eroded_wm, img.affine, img.header)
+#         nb.save(clean_fa, "{}/{}_clean{}".format(output_dir, output_base_name, ext))
+#         flirt.inputs.in_file = "{}/{}_clean{}".format(output_dir, output_base_name, ext)
+#         flirt.inputs.out_file = "{}/{}_clean_linear{}".format(output_dir, output_base_name, ext)
+#         flirt.inputs.out_matrix_file = "{}/{}_clean_linear.mat".format(output_dir, output_base_name)
+#         print("running linear registration")
+#         flirt.run()
+#         fnirt.inputs.in_file = "{}/{}_clean_linear{}".format(output_dir, output_base_name, ext)
+#         fnirt.inputs.warped_file = "{}/{}_clean_nonlinear{}".format(output_dir, output_base_name, ext)
+#         fnirt.inputs.field_file = "{}/{}_clean_nonlinearfield{}".format(output_dir, output_base_name, ext)
+#         print("running non linear registration")
+#         fnirt.run()
+#     else:
+#         flirt.inputs.in_file = fdwi
+#         flirt.inputs.out_file = "{}/{}_linear{}".format(output_dir, output_base_name, ext)
+#         flirt.inputs.out_matrix_file = "{}/{}_linear.mat".format(output_dir, output_base_name)
+#         print("running linear registration")
+#         flirt.run()
+#         fnirt.inputs.in_file = "{}/{}_linear{}".format(output_dir, output_base_name, ext)
+#         fnirt.inputs.warped_file = "{}/{}_nonlinear{}".format(output_dir, output_base_name, ext)
+#         fnirt.inputs.field_file = "{}/{}_nonlinearfield{}".format(output_dir, output_base_name, ext)
+#         print("running non linear registration")
+#         fnirt.run()
     
-    apply_warp.inputs.premat = flirt.inputs.out_matrix_file
-    apply_warp.inputs.field_file = fnirt.inputs.field_file    
-    print("applying warp")
-    for f in other_indexes:
-        output_base_name = get_base_name_all_type(f)
-        apply_warp.inputs.in_file = f
-        apply_warp.inputs.out_file = "{}/{}_nonlinear{}".format(output_dir, output_base_name, ext)
-        apply_warp.run()
+#     apply_warp.inputs.premat = flirt.inputs.out_matrix_file
+#     apply_warp.inputs.field_file = fnirt.inputs.field_file    
+#     print("applying warp")
+#     for f in other_indexes:
+#         output_base_name = get_base_name_all_type(f)
+#         apply_warp.inputs.in_file = f
+#         apply_warp.inputs.out_file = "{}/{}_nonlinear{}".format(output_dir, output_base_name, ext)
+#         apply_warp.run()
         
-def diff_direct_registration_longitudinal(base_dir,
-                   subject_id,
-                   output_dir,
-                   tbss_like = True,
-                   output_type = "NIFTI",
-                   template = "/usr/local/fsl/data/standard/FMRIB58_FA_1mm.nii.gz",
-                   config_file = "/usr/local/fsl/etc/flirtsch/FA_2_FMRIB58_1mm.cnf"):
-    if output_type == "NIFTI":
-        ext = ".nii"
-    elif output_type == "NIFTI_GZ":
-        ext = ".nii.gz"
-    else:
-        raise ValueError("Output file type {} not recognized".format(output_type))
+# def diff_direct_registration_longitudinal(base_dir,
+#                    subject_id,
+#                    output_dir,
+#                    tbss_like = True,
+#                    output_type = "NIFTI",
+#                    template = "/usr/local/fsl/data/standard/FMRIB58_FA_1mm.nii.gz",
+#                    config_file = "/usr/local/fsl/etc/flirtsch/FA_2_FMRIB58_1mm.cnf"):
+#     if output_type == "NIFTI":
+#         ext = ".nii"
+#     elif output_type == "NIFTI_GZ":
+#         ext = ".nii.gz"
+#     else:
+#         raise ValueError("Output file type {} not recognized".format(output_type))
     
-    dti_dir = "{}/derivatives/dipy_dti/{}".format(base_dir, subject_id)
-    fdwi_01 = glob("{}/ses-01/*FA.nii*".format(dti_dir))[0]
-    fdwi_02 = glob("{}/ses-02/*FA.nii*".format(dti_dir))[0]
-    # output_base_name = get_base_name_all_type(fdwi)
-    # other_indexes = glob("{}/*nii*".format(dti_dir))
-    # other_indexes.remove(fdwi)
-    if tbss_like:
-        for el in [fdwi_01, fdwi_02]:
-            output_base_name = get_base_name_all_type(el)
-            img = nb.load(el)
-            img_data = img.get_fdata()
-            binary_wm = np.zeros_like(img_data)
-            binary_wm[img_data != 0] = 1
-            eroded_wm_mask = binary_erosion(binary_wm)
-            eroded_wm = img_data * (eroded_wm_mask * 1)
-            eroded_wm[:,:,0] = 0
-            eroded_wm[:,:,-1] = 0
-            clean_fa = nb.Nifti1Image(eroded_wm, img.affine, img.header)
-            nb.save(clean_fa, "{}/{}_clean{}".format(output_dir, output_base_name, ext))
-        #flirt back and forth
-        clean_01 = glob("{}/*ses-01*_clean*".format(output_dir, output_base_name))
-        clean_02 = glob("{}/*ses-02*_clean*".format(output_dir, output_base_name))
-        flirt = FLIRT()
-        flirt.inputs.in_file = clean_01
-        flirt.inputs.reference = clean_02
-        flirt.inputs.output_type = output_type
-        flirt.inputs.out_file = "{}/t1_to_t2{}".format(output_dir, ext)
-        flirt.inputs.out_matrix_file = "{}/t1_to_t2.mat".format(output_dir)
-        flirt.run()
-        flirt.inputs.in_file = clean_02
-        flirt.inputs.reference = clean_01
-        flirt.inputs.output_type = output_type
-        flirt.inputs.out_file = "{}/t2_to_t1{}".format(output_dir, ext)
-        flirt.inputs.out_matrix_file = "{}/t2_to_t1.mat".format(output_dir)
-        mat_transform = ConvertXFM()
-        mat_transform.inputs.in_file = "{}/t2_to_t1.mat".format(output_dir)
-        mat_transform.inputs.inverse_xfm = True
-        mat_transform.inputs.out_file = "{}/t2_to_t1_inverted.mat".format(output_dir)
+#     dti_dir = "{}/derivatives/dipy_dti/{}".format(base_dir, subject_id)
+#     fdwi_01 = glob("{}/ses-01/*FA.nii*".format(dti_dir))[0]
+#     fdwi_02 = glob("{}/ses-02/*FA.nii*".format(dti_dir))[0]
+#     # output_base_name = get_base_name_all_type(fdwi)
+#     # other_indexes = glob("{}/*nii*".format(dti_dir))
+#     # other_indexes.remove(fdwi)
+#     if tbss_like:
+#         for el in [fdwi_01, fdwi_02]:
+#             output_base_name = get_base_name_all_type(el)
+#             img = nb.load(el)
+#             img_data = img.get_fdata()
+#             binary_wm = np.zeros_like(img_data)
+#             binary_wm[img_data != 0] = 1
+#             eroded_wm_mask = binary_erosion(binary_wm)
+#             eroded_wm = img_data * (eroded_wm_mask * 1)
+#             eroded_wm[:,:,0] = 0
+#             eroded_wm[:,:,-1] = 0
+#             clean_fa = nb.Nifti1Image(eroded_wm, img.affine, img.header)
+#             nb.save(clean_fa, "{}/{}_clean{}".format(output_dir, output_base_name, ext))
+#         #flirt back and forth
+#         clean_01 = glob("{}/*ses-01*_clean*".format(output_dir, output_base_name))
+#         clean_02 = glob("{}/*ses-02*_clean*".format(output_dir, output_base_name))
+#         flirt = FLIRT()
+#         flirt.inputs.in_file = clean_01
+#         flirt.inputs.reference = clean_02
+#         flirt.inputs.output_type = output_type
+#         flirt.inputs.out_file = "{}/t1_to_t2{}".format(output_dir, ext)
+#         flirt.inputs.out_matrix_file = "{}/t1_to_t2.mat".format(output_dir)
+#         flirt.run()
+#         flirt.inputs.in_file = clean_02
+#         flirt.inputs.reference = clean_01
+#         flirt.inputs.output_type = output_type
+#         flirt.inputs.out_file = "{}/t2_to_t1{}".format(output_dir, ext)
+#         flirt.inputs.out_matrix_file = "{}/t2_to_t1.mat".format(output_dir)
+#         mat_transform = ConvertXFM()
+#         mat_transform.inputs.in_file = "{}/t2_to_t1.mat".format(output_dir)
+#         mat_transform.inputs.inverse_xfm = True
+#         mat_transform.inputs.out_file = "{}/t2_to_t1_inverted.mat".format(output_dir)
         
-        fnirt = FNIRT()
-        apply_warp = ApplyWarp()
-        flirt.inputs.reference = template
-        flirt.inputs.output_type = output_type
-        fnirt.inputs.ref_file = template
-        fnirt.inputs.output_type = output_type
-        fnirt.inputs.config_file = config_file
-        fnirt.inputs.log_file = "{}/{}_fnirt.txt".format(output_dir, output_base_name)
-        apply_warp.inputs.ref_file = template
-        apply_warp.inputs.output_type = output_type
-        if tbss_like:
-            img = nb.load(fdwi)
-            img_data = img.get_fdata()
-            binary_wm = np.zeros_like(img_data)
-            binary_wm[img_data != 0] = 1
-            eroded_wm_mask = binary_erosion(binary_wm)
-            eroded_wm = img_data * (eroded_wm_mask * 1)
-            eroded_wm[:,:,0] = 0
-            eroded_wm[:,:,-1] = 0
-            clean_fa = nb.Nifti1Image(eroded_wm, img.affine, img.header)
-            nb.save(clean_fa, "{}/{}_clean{}".format(output_dir, output_base_name, ext))
-            flirt.inputs.in_file = "{}/{}_clean{}".format(output_dir, output_base_name, ext)
-            flirt.inputs.out_file = "{}/{}_clean_linear{}".format(output_dir, output_base_name, ext)
-            flirt.inputs.out_matrix_file = "{}/{}_clean_linear.mat".format(output_dir, output_base_name)
-            print("running linear registration")
-            flirt.run()
-            fnirt.inputs.in_file = "{}/{}_clean_linear{}".format(output_dir, output_base_name, ext)
-            fnirt.inputs.warped_file = "{}/{}_clean_nonlinear{}".format(output_dir, output_base_name, ext)
-            fnirt.inputs.field_file = "{}/{}_clean_nonlinearfield{}".format(output_dir, output_base_name, ext)
-            print("running non linear registration")
-            fnirt.run()
-        else:
-            flirt.inputs.in_file = fdwi
-            flirt.inputs.out_file = "{}/{}_linear{}".format(output_dir, output_base_name, ext)
-            flirt.inputs.out_matrix_file = "{}/{}_linear.mat".format(output_dir, output_base_name)
-            print("running linear registration")
-            flirt.run()
-            fnirt.inputs.in_file = "{}/{}_linear{}".format(output_dir, output_base_name, ext)
-            fnirt.inputs.warped_file = "{}/{}_nonlinear{}".format(output_dir, output_base_name, ext)
-            fnirt.inputs.field_file = "{}/{}_nonlinearfield{}".format(output_dir, output_base_name, ext)
-            print("running non linear registration")
-            fnirt.run()
+#         fnirt = FNIRT()
+#         apply_warp = ApplyWarp()
+#         flirt.inputs.reference = template
+#         flirt.inputs.output_type = output_type
+#         fnirt.inputs.ref_file = template
+#         fnirt.inputs.output_type = output_type
+#         fnirt.inputs.config_file = config_file
+#         fnirt.inputs.log_file = "{}/{}_fnirt.txt".format(output_dir, output_base_name)
+#         apply_warp.inputs.ref_file = template
+#         apply_warp.inputs.output_type = output_type
+#         if tbss_like:
+#             img = nb.load(fdwi)
+#             img_data = img.get_fdata()
+#             binary_wm = np.zeros_like(img_data)
+#             binary_wm[img_data != 0] = 1
+#             eroded_wm_mask = binary_erosion(binary_wm)
+#             eroded_wm = img_data * (eroded_wm_mask * 1)
+#             eroded_wm[:,:,0] = 0
+#             eroded_wm[:,:,-1] = 0
+#             clean_fa = nb.Nifti1Image(eroded_wm, img.affine, img.header)
+#             nb.save(clean_fa, "{}/{}_clean{}".format(output_dir, output_base_name, ext))
+#             flirt.inputs.in_file = "{}/{}_clean{}".format(output_dir, output_base_name, ext)
+#             flirt.inputs.out_file = "{}/{}_clean_linear{}".format(output_dir, output_base_name, ext)
+#             flirt.inputs.out_matrix_file = "{}/{}_clean_linear.mat".format(output_dir, output_base_name)
+#             print("running linear registration")
+#             flirt.run()
+#             fnirt.inputs.in_file = "{}/{}_clean_linear{}".format(output_dir, output_base_name, ext)
+#             fnirt.inputs.warped_file = "{}/{}_clean_nonlinear{}".format(output_dir, output_base_name, ext)
+#             fnirt.inputs.field_file = "{}/{}_clean_nonlinearfield{}".format(output_dir, output_base_name, ext)
+#             print("running non linear registration")
+#             fnirt.run()
+#         else:
+#             flirt.inputs.in_file = fdwi
+#             flirt.inputs.out_file = "{}/{}_linear{}".format(output_dir, output_base_name, ext)
+#             flirt.inputs.out_matrix_file = "{}/{}_linear.mat".format(output_dir, output_base_name)
+#             print("running linear registration")
+#             flirt.run()
+#             fnirt.inputs.in_file = "{}/{}_linear{}".format(output_dir, output_base_name, ext)
+#             fnirt.inputs.warped_file = "{}/{}_nonlinear{}".format(output_dir, output_base_name, ext)
+#             fnirt.inputs.field_file = "{}/{}_nonlinearfield{}".format(output_dir, output_base_name, ext)
+#             print("running non linear registration")
+#             fnirt.run()
         
-        apply_warp.inputs.premat = flirt.inputs.out_matrix_file
-        apply_warp.inputs.field_file = fnirt.inputs.field_file    
-        print("applying warp")
-        for f in other_indexes:
-            output_base_name = get_base_name_all_type(f)
-            apply_warp.inputs.in_file = f
-            apply_warp.inputs.out_file = "{}/{}_nonlinear{}".format(output_dir, output_base_name, ext)
-            apply_warp.run()
+#         apply_warp.inputs.premat = flirt.inputs.out_matrix_file
+#         apply_warp.inputs.field_file = fnirt.inputs.field_file    
+#         print("applying warp")
+#         for f in other_indexes:
+#             output_base_name = get_base_name_all_type(f)
+#             apply_warp.inputs.in_file = f
+#             apply_warp.inputs.out_file = "{}/{}_nonlinear{}".format(output_dir, output_base_name, ext)
+#             apply_warp.run()
