@@ -222,8 +222,7 @@ def custom_brain_extraction(output_base_name,
     bet_out_file = "{}/{}_ec_bet{}".format(output_dir, output_base_name, ext)
     bet_out_file_mask = "{}/{}_ec_bet_mask{}".format(output_dir, output_base_name, ext)
     bet = BET(in_file = diff_mean_filename, out_file = bet_out_file, 
-                  frac = .3,
-                  mask = True, output_type = output_type)
+                 mask = True, output_type = output_type)
     bet.run()
     b0_mask = nb.load(bet_out_file_mask)
     b0_mask_array = b0_mask.get_fdata()
@@ -243,3 +242,4 @@ def custom_brain_extraction(output_base_name,
     remove(bet_out_file)
     remove(bet_out_file_mask)
     return(mask_output_filename, masked_output_filename)
+
